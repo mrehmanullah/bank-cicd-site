@@ -1,0 +1,27 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: rqbank-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: rqbank
+      rules:
+        - alert: RQBankNoAvailablePods
+          expr: |
+            kube_deployment_status_replicas_available{namespace="rqbank",deployment="rqbank-web"} < 1
+            or absent(kube_deployment_status_replicas_available{namespace="rqbank",deployment="rqbank-web"})
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "RQ Bank web has no available pods"
+        - alert: RQBankHighCPU
+          expr: sum(rate(container_cpu_usage_seconds_total{namespace="rqbank",container!=""}[5m])) > 0.3
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RQ Bank CPU usage is high"
