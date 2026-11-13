@@ -1,0 +1,50 @@
+name: ci-cd
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['k8s/**', 'terraform/**', 'argocd/**', 'monitoring/**', '**.md']
+  pull_request:
+
+permissions:
+  contents: write    # commit the new image tag
+  packages: write    # push to ghcr.io
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npx --yes html-validate index.html
+      - name: Build and smoke test
+        run: |
+          docker build -t rqbank-web:test .
+          docker run -d -p 8080:80 --name t rqbank-web:test
+          sleep 3
+          curl -fsS http://localhost:8080 | grep -q "RQ Bank"
+
+  build-push-update:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        run: |
+          IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/rqbank-web
+          TAG=${GITHUB_SHA::7}
+          docker build -t $IMAGE:$TAG .
+          docker push $IMAGE:$TAG
+          sed -i "s|newTag: .*|newTag: $TAG|" k8s/overlays/local/kustomization.yaml
+      - name: Commit new tag
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add k8s/overlays/local/kustomization.yaml
+          git commit -m "ci: deploy ${GITHUB_SHA::7} [skip ci]" || exit 0
+          git pull --rebase origin main
+          git push
