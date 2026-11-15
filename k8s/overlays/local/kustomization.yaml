@@ -1,12 +1,16 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-resources: [../../base]
+resources:
+  - ../../base
 images:
   - name: rqbank-web
+    # CI replaces newName and newTag below on every deploy.
     newName: rqbank-web
-    newTag: local          # CI replaces this with the commit SHA
+    newTag: local
 patches:
-  - target: { kind: Service, name: rqbank-web }
+  - target:
+      kind: Service
+      name: rqbank-web
     patch: |-
       - op: replace
         path: /spec/type

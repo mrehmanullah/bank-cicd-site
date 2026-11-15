@@ -1,50 +1,154 @@
+# =============================================================================
+# RQ Bank CI/CD
+#
+#   pull request  ->  job "test" only (nothing is pushed or deployed)
+#   push to main  ->  job "test", then job "build-push-update"
+#
+# Deployment is GitOps: this pipeline builds the image, pushes it to GHCR and
+# commits the new image name and tag into k8s/overlays/local/kustomization.yaml.
+# Argo CD sees that commit and rolls the new image out to the cluster.
+# =============================================================================
 name: ci-cd
+
 on:
   push:
     branches: [main]
+    # Changes to these paths do not need a new image. This also stops the
+    # pipeline from re-triggering itself after it commits the new tag.
     paths-ignore: ['k8s/**', 'terraform/**', 'argocd/**', 'monitoring/**', '**.md']
   pull_request:
 
+# Least privilege: everything is read-only by default.
+# Only the deploy job below is given write access.
 permissions:
-  contents: write    # commit the new image tag
-  packages: write    # push to ghcr.io
+  contents: read
+
+# Never run two pipelines for the same branch at the same time.
+# Queue them instead of cancelling, so a deploy is never cut in half.
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # JOB 1: test (runs on pull requests and pushes)
+  # ---------------------------------------------------------------------------
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
+      # Step 1: get the code. No credentials are kept on disk, since this job
+      # never needs to push anything.
       - uses: actions/checkout@v4
-      - run: npx --yes html-validate index.html
-      - name: Build and smoke test
-        run: |
-          docker build -t rqbank-web:test .
-          docker run -d -p 8080:80 --name t rqbank-web:test
-          sleep 3
-          curl -fsS http://localhost:8080 | grep -q "RQ Bank"
+        with:
+          persist-credentials: false
 
+      # Step 2: check the HTML. Fails the pipeline on any validation error.
+      - name: Validate HTML
+        run: npx --yes html-validate index.html
+
+      # Step 3: build the image exactly as production will.
+      - name: Build image
+        run: docker build -t rqbank-web:test .
+
+      # Step 4: scan the image for known vulnerabilities. Report only for now:
+      # it never fails the pipeline. To make it block builds, change
+      # "--exit-code 0" to "--exit-code 1" once the report is clean.
+      - name: Scan image (report only)
+        continue-on-error: true
+        run: |
+          docker save rqbank-web:test -o "$RUNNER_TEMP/image.tar"
+          docker run --rm -v "$RUNNER_TEMP:/work" aquasec/trivy:latest image \
+            --input /work/image.tar --severity HIGH,CRITICAL \
+            --ignore-unfixed --exit-code 0
+
+      # Step 5: start the container and check that the site answers and
+      # contains "RQ Bank". Retries for up to 30 seconds instead of guessing
+      # with a fixed sleep. The container name must be at least 2 characters.
+      - name: Smoke test
+        run: |
+          docker run -d -p 8080:80 --name rqbank-test rqbank-web:test
+          for i in $(seq 1 15); do
+            if curl -fsS http://localhost:8080 -o "$RUNNER_TEMP/out.html" \
+               && grep -q "RQ Bank" "$RUNNER_TEMP/out.html"; then
+              echo "Smoke test passed"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Smoke test failed. Container logs:"
+          docker logs rqbank-test
+          exit 1
+
+      # Step 6: always remove the test container, even if an earlier step failed.
+      - name: Cleanup
+        if: always()
+        run: docker rm -f rqbank-test || true
+
+  # ---------------------------------------------------------------------------
+  # JOB 2: build-push-update (runs only on pushes to main, after tests pass)
+  # ---------------------------------------------------------------------------
   build-push-update:
     needs: test
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Write access exists only in this job.
+    permissions:
+      contents: write   # commit the new image tag back to the repo
+      packages: write   # push the image to ghcr.io
     steps:
+      # Step 1: get the code. Credentials are kept so the job can push the tag commit.
       - uses: actions/checkout@v4
+
+      # Step 2: sign in to GitHub Container Registry with the built-in token.
+      # No personal access token or stored secret is needed.
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push
+
+      # Step 3: build the image and push it. The tag is the first 7 characters
+      # of the commit SHA, so every deploy is traceable to a commit.
+      # GitHub values are passed through "env:" instead of being pasted into
+      # the script, which prevents script injection.
+      - name: Build and push image
+        env:
+          OWNER: ${{ github.repository_owner }}
+          SHA: ${{ github.sha }}
         run: |
-          IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/rqbank-web
-          TAG=${GITHUB_SHA::7}
-          docker build -t $IMAGE:$TAG .
-          docker push $IMAGE:$TAG
-          sed -i "s|newTag: .*|newTag: $TAG|" k8s/overlays/local/kustomization.yaml
-      - name: Commit new tag
+          IMAGE="ghcr.io/${OWNER,,}/rqbank-web"
+          TAG="${SHA::7}"
+          docker build -t "$IMAGE:$TAG" .
+          docker push "$IMAGE:$TAG"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      # Step 4: point the Kustomize overlay at the new image. Both the name
+      # and the tag are set, so the cluster always pulls what was just pushed.
+      # The grep lines make the step fail loudly if the overlay file does not
+      # contain "newName:" and "newTag:" lines to replace.
+      - name: Update image in overlay
         run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
+          FILE=k8s/overlays/local/kustomization.yaml
+          sed -i "s|newName: .*|newName: ${IMAGE}|" "$FILE"
+          sed -i "s|newTag: .*|newTag: ${TAG}|" "$FILE"
+          grep -q "newName: ${IMAGE}" "$FILE"
+          grep -q "newTag: ${TAG}" "$FILE"
+          cat "$FILE"
+
+      # Step 5: commit the change. Does nothing if the file did not change.
+      # "[skip ci]" and the paths-ignore rule above prevent a pipeline loop.
+      - name: Commit and push new tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add k8s/overlays/local/kustomization.yaml
-          git commit -m "ci: deploy ${GITHUB_SHA::7} [skip ci]" || exit 0
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "ci: deploy ${TAG} [skip ci]"
           git pull --rebase origin main
           git push
