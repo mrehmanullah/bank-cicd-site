@@ -5,8 +5,8 @@ resources:
 images:
   - name: rqbank-web
     # CI replaces newName and newTag below on every deploy.
-    newName: rqbank-web
-    newTag: local
+    newName: ghcr.io/mrehmanullah/rqbank-web
+    newTag: 7c01232
 patches:
   - target:
       kind: Service
